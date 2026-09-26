@@ -13,12 +13,15 @@ jobs:
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
+
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "UserAuthentication" -Value 0 -Force
+
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
+
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
 
@@ -27,6 +30,7 @@ jobs:
       - name: Create RDP User with Secure Password
         run: |
           Add-Type -AssemblyName System.Security
+
           $charSet = @{
               Upper   = [char[]](65..90)
               Lower   = [char[]](97..122)
@@ -42,38 +46,66 @@ jobs:
           $rawPassword += $charSet.Special | Get-Random -Count 4
 
           $password = -join ($rawPassword | Sort-Object { Get-Random })
+
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          New-LocalUser -Name "maxxciey" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "maxxciey"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "maxxciey"
+          New-LocalUser `
+            -Name "maxxciey" `
+            -Password $securePass `
+            -AccountNeverExpires
 
-          echo "RDP_CREDS=User: maxxciey | Password: $password" >> $env:GITHUB_ENV
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member "maxxciey"
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member "maxxciey"
+
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
           if (-not (Get-LocalUser -Name "maxxciey")) {
               Write-Error "User creation failed"
               exit 1
           }
 
+          Write-Host "RDP user maxxciey created successfully."
+
       - name: Install Tailscale
         run: |
+          $ErrorActionPreference = "Stop"
+
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
 
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Invoke-WebRequest `
+            -Uri $tsUrl `
+            -OutFile $installerPath
+
+          Start-Process `
+            msiexec.exe `
+            -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
+            -Wait
+
           Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $ErrorActionPreference = "Stop"
+
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=gh-runner-$env:GITHUB_RUN_ID
 
           $tsIP = $null
           $retries = 0
 
           while (-not $tsIP -and $retries -lt 10) {
+
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+
               Start-Sleep -Seconds 5
+
               $retries++
           }
 
@@ -84,11 +116,15 @@ jobs:
 
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
+          Write-Host "Tailscale IP assigned: $tsIP"
+
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
 
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          $testResult = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389
 
           if (-not $testResult.TcpTestSucceeded) {
               Write-Error "TCP connection to RDP port 3389 failed"
@@ -105,16 +141,30 @@ jobs:
           $mt5Url = "https://download.mql5.com/cdn/web/deriv.com.limited/mt5/deriv5setup.exe"
           $mt5Path = "$env:TEMP\deriv5setup.exe"
 
-          Invoke-WebRequest -Uri $mt5Url -OutFile $mt5Path
-          Start-Process -FilePath $mt5Path -ArgumentList "/auto" -Wait
+          Invoke-WebRequest `
+            -Uri $mt5Url `
+            -OutFile $mt5Path
+
+          Start-Process `
+            -FilePath $mt5Path `
+            -ArgumentList "/auto" `
+            -Wait
+
           Remove-Item $mt5Path -Force
 
           # --- VS Code ---
           $vscodeUrl = "https://vscode.download.prss.microsoft.com/dbazure/download/stable/df53daabb18cd157bdb08c7f01c34df936cf12f4/VSCodeSetup-x64-1.132.0.exe"
           $vscodePath = "$env:TEMP\vscodesetup.exe"
 
-          Invoke-WebRequest -Uri $vscodeUrl -OutFile $vscodePath
-          Start-Process -FilePath $vscodePath -ArgumentList "/VERYSILENT", "/NORESTART", "/ALLUSERS=1", "/MERGETASKS=!runcode,addcontextmenufiles,addcontextmenufolders,addtopath" -Wait
+          Invoke-WebRequest `
+            -Uri $vscodeUrl `
+            -OutFile $vscodePath
+
+          Start-Process `
+            -FilePath $vscodePath `
+            -ArgumentList "/VERYSILENT", "/NORESTART", "/ALLUSERS=1", "/MERGETASKS=!runcode,addcontextmenufiles,addcontextmenufolders,addtopath" `
+            -Wait
+
           Remove-Item $vscodePath -Force
 
           if (-not (Test-Path "C:\Program Files\Microsoft VS Code\Code.exe")) {
@@ -131,40 +181,197 @@ jobs:
           $repoUrl = "https://github.com/Techtoxic/Oopus4.8-advanced-deriv-trading-algos-2026.git"
 
           $downloadsDir = "C:\Users\maxxciey\Downloads"
-          New-Item -ItemType Directory -Force -Path $downloadsDir | Out-Null
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path $downloadsDir | Out-Null
 
           $cloneDir = "$downloadsDir\Oopus4.8-advanced-deriv-trading-algos-2026"
 
-          # Remove accidental whitespace/newlines from the secret
+          # Remove existing directory if present
+          if (Test-Path $cloneDir) {
+              Remove-Item $cloneDir -Recurse -Force
+          }
+
+          # Remove accidental whitespace/newlines from the token
           $token = "${{ secrets.GTOKEN }}".Trim()
 
-          # Create Basic authentication header
-          $auth = [Convert]::ToBase64String(
-              [Text.Encoding]::ASCII.GetBytes("x-access-token:$token")
+          # Build GitHub Basic authentication header
+          $authBytes = [Text.Encoding]::ASCII.GetBytes(
+              "x-access-token:$token"
           )
 
-          git -c "http.extraheader=AUTHORIZATION: basic $auth" `
-              clone --branch fable-thoughts --single-branch `
-              $repoUrl $cloneDir
+          $auth = [Convert]::ToBase64String($authBytes)
+
+          # Clone ONLY the fable-thoughts branch
+          git `
+            -c "http.extraheader=AUTHORIZATION: basic $auth" `
+            clone `
+            --branch fable-thoughts `
+            --single-branch `
+            $repoUrl `
+            $cloneDir
 
           if (-not (Test-Path "$cloneDir\.git")) {
-              Write-Error "Clone failed — check GTOKEN permissions and that fable-thoughts exists"
+              Write-Error "Clone failed — check GTOKEN permissions and that fable-thoughts exists."
               exit 1
           }
 
           Write-Host "Repo cloned successfully."
+          Write-Host "Repository: Oopus4.8-advanced-deriv-trading-algos-2026"
           Write-Host "Branch: fable-thoughts"
           Write-Host "Location: $cloneDir"
 
       - name: Maintain Connection
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "          RDP ACCESS"
+          Write-Host "======================================"
+          Write-Host "Address:  $env:TAILSCALE_IP"
           Write-Host "Username: maxxciey"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "======================================"
+          Write-Host ""
+
+          Write-Host "Starting RDP health monitor..."
+          Write-Host "TermService will be checked every 60 seconds."
+          Write-Host ""
 
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
+
+              try {
+
+                  # ==========================================
+                  # CHECK TERMINAL SERVICES
+                  # ==========================================
+
+                  $service = Get-Service `
+                    -Name TermService `
+                    -ErrorAction Stop
+
+                  if ($service.Status -ne "Running") {
+
+                      Write-Host ""
+                      Write-Host "[$(Get-Date)] WARNING: TermService status = $($service.Status)"
+                      Write-Host "Attempting to start TermService..."
+
+                      Start-Service `
+                        -Name TermService `
+                        -ErrorAction Stop
+
+                      Start-Sleep -Seconds 10
+
+                      $service = Get-Service -Name TermService
+
+                      Write-Host "[$(Get-Date)] TermService status: $($service.Status)"
+                  }
+
+                  # ==========================================
+                  # CHECK RDP PORT
+                  # ==========================================
+
+                  $listener = Get-NetTCPConnection `
+                    -LocalPort 3389 `
+                    -State Listen `
+                    -ErrorAction SilentlyContinue
+
+                  if (-not $listener) {
+
+                      Write-Host ""
+                      Write-Host "[$(Get-Date)] WARNING: RDP port 3389 is NOT listening."
+                      Write-Host "Restarting TermService..."
+
+                      Restart-Service `
+                        -Name TermService `
+                        -Force `
+                        -ErrorAction Stop
+
+                      Start-Sleep -Seconds 15
+
+                      $listener = Get-NetTCPConnection `
+                        -LocalPort 3389 `
+                        -State Listen `
+                        -ErrorAction SilentlyContinue
+
+                      if ($listener) {
+                          Write-Host "[$(Get-Date)] RDP listener restored successfully."
+                      }
+                      else {
+                          Write-Host "[$(Get-Date)] WARNING: RDP listener still unavailable."
+                      }
+                  }
+
+                  # ==========================================
+                  # CHECK TAILSCALE
+                  # ==========================================
+
+                  $tailscaleStatus = & `
+                    "$env:ProgramFiles\Tailscale\tailscale.exe" `
+                    status 2>&1
+
+                  if ($LASTEXITCODE -ne 0) {
+
+                      Write-Host ""
+                      Write-Host "[$(Get-Date)] WARNING: Tailscale status check failed."
+                      Write-Host "Attempting to restart Tailscale..."
+
+                      Restart-Service `
+                        -Name Tailscale `
+                        -Force `
+                        -ErrorAction SilentlyContinue
+
+                      Start-Sleep -Seconds 15
+                  }
+
+                  # ==========================================
+                  # NORMAL STATUS
+                  # ==========================================
+
+                  Write-Host ""
+                  Write-Host "[$(Get-Date)] RDP Active"
+                  Write-Host "    TermService: $((Get-Service TermService).Status)"
+                  Write-Host "    RDP Port:    3389"
+                  Write-Host "    Tailscale:   OK"
+
+              }
+
+              catch {
+
+                  Write-Host ""
+                  Write-Host "[$(Get-Date)] RDP health check failed:"
+                  Write-Host $_.Exception.Message
+
+                  # ==========================================
+                  # RECOVERY
+                  # ==========================================
+
+                  try {
+
+                      Write-Host "[$(Get-Date)] Attempting TermService recovery..."
+
+                      Restart-Service `
+                        -Name TermService `
+                        -Force `
+                        -ErrorAction Stop
+
+                      Start-Sleep -Seconds 15
+
+                      Write-Host "[$(Get-Date)] TermService recovery completed."
+
+                  }
+                  catch {
+
+                      Write-Host ""
+                      Write-Host "[$(Get-Date)] ERROR: Could not restart TermService."
+                      Write-Host $_.Exception.Message
+                  }
+              }
+
+              # ==========================================
+              # WAIT BEFORE NEXT HEALTH CHECK
+              # ==========================================
+
+              Start-Sleep -Seconds 60
           }
