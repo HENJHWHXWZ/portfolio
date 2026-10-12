@@ -180,16 +180,66 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $ProgressPreference = 'SilentlyContinue'
 
-          # MetaTrader 5 - Deriv installer
+          # MetaTrader 5 - Deriv installer.
+          # Keep this install non-fatal: an MT5 bootstrapper failure must not terminate
+          # the job and destroy the RDP session. Verify the terminal instead of trusting
+          # the installer exit code alone, and print diagnostics if it was not installed.
           $mt5Url = 'https://download.mql5.com/cdn/web/deriv.com.limited/mt5/deriv5setup.exe'
           $mt5Path = Join-Path $env:TEMP 'deriv5setup.exe'
-          Invoke-WebRequest -Uri $mt5Url -OutFile $mt5Path -UseBasicParsing
-          $mt5 = Start-Process -FilePath $mt5Path -ArgumentList '/auto' -Wait -PassThru
-          Remove-Item $mt5Path -Force -ErrorAction SilentlyContinue
-          if ($mt5.ExitCode -ne 0) {
-            throw "Deriv MT5 installer exited with code $($mt5.ExitCode)."
+          $mt5ExitCode = 'not-started'
+          $mt5Terminal = $null
+          try {
+            Invoke-WebRequest -Uri $mt5Url -OutFile $mt5Path -UseBasicParsing
+            $mt5File = Get-Item $mt5Path -ErrorAction Stop
+            Write-Host "Downloaded Deriv MT5 bootstrapper: $($mt5File.Length) bytes."
+            if ($mt5File.Length -lt 100KB) {
+              throw "Downloaded installer is unexpectedly small ($($mt5File.Length) bytes)."
+            }
+            $signature = Get-AuthenticodeSignature -FilePath $mt5Path
+            Write-Host "MT5 installer signature status: $($signature.Status)"
+
+            $mt5 = Start-Process -FilePath $mt5Path -ArgumentList '/auto' -Wait -PassThru
+            $mt5ExitCode = [string]$mt5.ExitCode
+            Write-Host "Deriv MT5 installer process exit code: $mt5ExitCode"
+
+            # Check common installation locations. The terminal may be installed even
+            # if the bootstrapper reports a non-zero process code.
+            $candidatePaths = @(
+              'C:\Program Files\Deriv MT5\terminal64.exe',
+              'C:\Program Files (x86)\Deriv MT5\terminal64.exe',
+              'C:\Program Files\MetaTrader 5\terminal64.exe',
+              'C:\Program Files (x86)\MetaTrader 5\terminal64.exe'
+            )
+            $mt5Terminal = $candidatePaths | Where-Object { Test-Path $_ } | Select-Object -First 1
+            if (-not $mt5Terminal) {
+              foreach ($root in @('C:\Program Files', 'C:\Program Files (x86)')) {
+                if (Test-Path $root) {
+                  $found = Get-ChildItem -Path $root -Filter 'terminal64.exe' -File -Recurse -ErrorAction SilentlyContinue |
+                    Where-Object { $_.FullName -match 'Deriv|MetaTrader|MT5' } |
+                    Select-Object -First 1
+                  if ($found) {
+                    $mt5Terminal = $found.FullName
+                    break
+                  }
+                }
+              }
+            }
+
+            if ($mt5Terminal) {
+              Write-Host "Deriv/MetaTrader terminal found: $mt5Terminal"
+              Add-Content -Path $env:GITHUB_ENV -Value 'MT5_INSTALL_STATUS=installed'
+              Add-Content -Path $env:GITHUB_ENV -Value "MT5_TERMINAL_PATH=$mt5Terminal"
+            } else {
+              Write-Warning "MT5 terminal was not found after installer exit code $mt5ExitCode. Continuing so RDP stays available; MT5 may need to be installed manually in the session."
+              Add-Content -Path $env:GITHUB_ENV -Value "MT5_INSTALL_STATUS=not-confirmed_exit_$mt5ExitCode"
+            }
+          } catch {
+            Write-Warning "MT5 automatic installation failed: $($_.Exception.Message)"
+            Write-Warning 'Continuing the workflow so an MT5 installer failure does not terminate the RDP session.'
+            Add-Content -Path $env:GITHUB_ENV -Value 'MT5_INSTALL_STATUS=failed'
+          } finally {
+            Remove-Item $mt5Path -Force -ErrorAction SilentlyContinue
           }
-          Write-Host 'Deriv MT5 installer finished.'
 
           # Download the current stable VS Code user-independent installer.
           $vscodeUrl = 'https://update.code.visualstudio.com/latest/win32-x64/stable'
