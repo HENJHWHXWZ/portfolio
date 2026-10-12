@@ -46,7 +46,7 @@ jobs:
             -Password $securePassword `
             -PasswordNeverExpires `
             -AccountNeverExpires `
-            -Description 'Temporary RDP account for this GitHub Actions run' | Out-Null
+            -Description 'Temporary RDP account' | Out-Null
 
           Add-LocalGroupMember -Group 'Administrators' -Member 'maxxciey'
           Add-LocalGroupMember -Group 'Remote Desktop Users' -Member 'maxxciey'
