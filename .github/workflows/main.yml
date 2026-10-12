@@ -3,375 +3,323 @@ name: RDP
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   secure-rdp:
-    runs-on: windows-latest
-    timeout-minutes: 3600
+    # Pin the OS while troubleshooting the intermittent blank desktop.
+    runs-on: windows-2022
+    # GitHub-hosted standard runners do not support a 3600-minute job.
+    timeout-minutes: 360
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: Create RDP user and configure RDP securely
+        shell: powershell
         run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Generate a fresh password with upper/lower/digit/special characters.
+          $upper   = 'ABCDEFGHJKLMNPQRSTUVWXYZ'.ToCharArray()
+          $lower   = 'abcdefghijkmnopqrstuvwxyz'.ToCharArray()
+          $digits  = '23456789'.ToCharArray()
+          $special = '!@#$%_-+='.ToCharArray()
+          $pool = $upper + $lower + $digits + $special
+
+          $passwordChars = @(
+            (Get-Random -InputObject $upper)
+            (Get-Random -InputObject $lower)
+            (Get-Random -InputObject $digits)
+            (Get-Random -InputObject $special)
+          )
+          for ($i = 0; $i -lt 20; $i++) {
+            $passwordChars += Get-Random -InputObject $pool
+          }
+          $password = -join ($passwordChars | Sort-Object { Get-Random })
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+
+          # This is a new GitHub-hosted VM for each run, so the account should not exist yet.
+          if (Get-LocalUser -Name 'maxxciey' -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name 'maxxciey'
+          }
+          New-LocalUser -Name 'maxxciey' `
+            -Password $securePassword `
+            -PasswordNeverExpires `
+            -AccountNeverExpires `
+            -Description 'Temporary RDP account for this GitHub Actions run' | Out-Null
+
+          Add-LocalGroupMember -Group 'Administrators' -Member 'maxxciey'
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member 'maxxciey'
+
+          # Keep the generated credential available to later steps without printing it here.
+          Add-Content -Path $env:GITHUB_ENV -Value "RDP_PASSWORD=$password"
+          $securePassword = $null
+          $passwordChars = $null
+          $password = $null
+
+          # Enable RDP and retain standard RDP security protections.
+          $rdpTcp = 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
+            -Name 'fDenyTSConnections' -Value 0 -Force
+          Set-ItemProperty -Path $rdpTcp -Name 'UserAuthentication' -Value 1 -Force
+          Set-ItemProperty -Path $rdpTcp -Name 'SecurityLayer' -Value 1 -Force
+          Set-ItemProperty -Path $rdpTcp -Name 'MinEncryptionLevel' -Value 3 -Force
 
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
+          # Normalize the standard Windows logon shell. This will not repair a hung session,
+          # but prevents a nonstandard Shell/Userinit value from producing a shell-less desktop.
+          $winlogon = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+          Set-ItemProperty -Path $winlogon -Name 'Shell' -Value 'explorer.exe' -Force
+          Set-ItemProperty -Path $winlogon -Name 'Userinit' `
+            -Value "$env:SystemRoot\system32\userinit.exe," -Force
 
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+          # Use a dedicated firewall rule limited to Tailscale's 100.64.0.0/10 address range.
+          Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule -ErrorAction SilentlyContinue
+          Get-NetFirewallRule -Name 'RDP-Tailscale' -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule -ErrorAction SilentlyContinue
+          New-NetFirewallRule `
+            -Name 'RDP-Tailscale' `
+            -DisplayName 'RDP through Tailscale only' `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress '100.64.0.0/10' `
+            -Profile Any | Out-Null
 
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-
+          # Restart once during setup, before the user connects. Do not periodically restart it.
           Restart-Service -Name TermService -Force
+          Start-Sleep -Seconds 5
 
-      - name: Create RDP User with Secure Password
-        run: |
-          Add-Type -AssemblyName System.Security
-
-          $charSet = @{
-              Upper   = [char[]](65..90)
-              Lower   = [char[]](97..122)
-              Number  = [char[]](48..57)
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126))
+          $service = Get-Service -Name TermService
+          $listener = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+          if ($service.Status -ne 'Running') {
+            throw "Remote Desktop Services is not running (status: $($service.Status))."
+          }
+          if (-not $listener) {
+            throw 'RDP TCP port 3389 is not listening after configuration.'
           }
 
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-
-          New-LocalUser `
-            -Name "maxxciey" `
-            -Password $securePass `
-            -AccountNeverExpires
-
-          Add-LocalGroupMember `
-            -Group "Administrators" `
-            -Member "maxxciey"
-
-          Add-LocalGroupMember `
-            -Group "Remote Desktop Users" `
-            -Member "maxxciey"
-
-          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
-
-          if (-not (Get-LocalUser -Name "maxxciey")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
-
-          Write-Host "RDP user maxxciey created successfully."
+          Write-Host 'RDP user created; NLA enabled; dedicated Tailscale firewall rule configured.'
+          Write-Host 'RDP service and TCP listener are running.'
 
       - name: Install Tailscale
+        shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
 
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-
-          Invoke-WebRequest `
-            -Uri $tsUrl `
-            -OutFile $installerPath
-
-          Start-Process `
-            msiexec.exe `
-            -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
-            -Wait
-
-          Remove-Item $installerPath -Force
-
-      - name: Establish Tailscale Connection
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
-            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
-            --hostname=gh-runner-$env:GITHUB_RUN_ID
-
-          $tsIP = $null
-          $retries = 0
-
-          while (-not $tsIP -and $retries -lt 10) {
-
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-
-              Start-Sleep -Seconds 5
-
-              $retries++
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw 'Missing repository secret TAILSCALE_AUTH_KEY.'
           }
 
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
+          $installerPath = Join-Path $env:TEMP 'tailscale-setup.msi'
+          $installerUrl = 'https://pkgs.tailscale.com/stable/tailscale-setup-1.102.3-amd64.msi'
+          Invoke-WebRequest -Uri $installerUrl -OutFile $installerPath -UseBasicParsing
+
+          $install = Start-Process -FilePath 'msiexec.exe' `
+            -ArgumentList "/i `"$installerPath`" /qn /norestart" `
+            -Wait -PassThru
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
+          if ($install.ExitCode -notin @(0, 3010)) {
+            throw "Tailscale installation failed with exit code $($install.ExitCode)."
           }
 
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          $tailscaleExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          if (-not (Test-Path $tailscaleExe)) {
+            throw "Tailscale executable not found at $tailscaleExe."
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_EXE=$tailscaleExe"
+          Write-Host 'Tailscale installed.'
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
 
-          Write-Host "Tailscale IP assigned: $tsIP"
-
-      - name: Verify RDP Accessibility
+      - name: Connect to Tailscale and verify RDP reachability
+        shell: powershell
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $ErrorActionPreference = 'Stop'
+          $tailscaleExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          $hostname = "gh-rdp-$env:GITHUB_RUN_ID"
 
-          $testResult = Test-NetConnection `
-            -ComputerName $env:TAILSCALE_IP `
-            -Port 3389
-
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
+          # For best hygiene, configure TAILSCALE_AUTH_KEY as reusable + ephemeral,
+          # with a tag permitted by your tailnet policy.
+          & $tailscaleExe up "--authkey=$($env:TAILSCALE_AUTH_KEY.Trim())" "--hostname=$hostname"
+          if ($LASTEXITCODE -ne 0) {
+            throw "tailscale up failed with exit code $LASTEXITCODE."
           }
 
-          Write-Host "TCP connectivity successful!"
-
-      - name: Install MetaTrader5 (Deriv) and VS Code
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          # --- MT5 ---
-          $mt5Url = "https://download.mql5.com/cdn/web/deriv.com.limited/mt5/deriv5setup.exe"
-          $mt5Path = "$env:TEMP\deriv5setup.exe"
-
-          Invoke-WebRequest `
-            -Uri $mt5Url `
-            -OutFile $mt5Path
-
-          Start-Process `
-            -FilePath $mt5Path `
-            -ArgumentList "/auto" `
-            -Wait
-
-          Remove-Item $mt5Path -Force
-
-          # --- VS Code ---
-          $vscodeUrl = "https://vscode.download.prss.microsoft.com/dbazure/download/stable/df53daabb18cd157bdb08c7f01c34df936cf12f4/VSCodeSetup-x64-1.132.0.exe"
-          $vscodePath = "$env:TEMP\vscodesetup.exe"
-
-          Invoke-WebRequest `
-            -Uri $vscodeUrl `
-            -OutFile $vscodePath
-
-          Start-Process `
-            -FilePath $vscodePath `
-            -ArgumentList "/VERYSILENT", "/NORESTART", "/ALLUSERS=1", "/MERGETASKS=!runcode,addcontextmenufiles,addcontextmenufolders,addtopath" `
-            -Wait
-
-          Remove-Item $vscodePath -Force
-
-          if (-not (Test-Path "C:\Program Files\Microsoft VS Code\Code.exe")) {
-              Write-Error "VS Code install failed — binary not found"
-              exit 1
+          $tsIP = ''
+          for ($i = 0; $i -lt 20 -and [string]::IsNullOrWhiteSpace($tsIP); $i++) {
+            Start-Sleep -Seconds 3
+            $ipOutput = & $tailscaleExe ip -4 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              $tsIP = [string]($ipOutput | Select-Object -First 1)
+              $tsIP = $tsIP.Trim()
+            }
+          }
+          if ([string]::IsNullOrWhiteSpace($tsIP)) {
+            & $tailscaleExe status 2>&1 | ForEach-Object { Write-Host $_ }
+            throw 'Tailscale did not assign an IPv4 address within 60 seconds.'
           }
 
-          Write-Host "MT5 and VS Code installation confirmed."
+          $listener = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+          if (-not $listener) {
+            throw 'RDP port 3389 is no longer listening.'
+          }
 
-      - name: Clone Private Repo into maxxciey's Downloads folder
+          Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$tsIP"
+          Write-Host "Tailscale IPv4: $tsIP"
+          Write-Host "RDP endpoint: $tsIP`:3389"
+          Write-Host 'RDP listener is present. This confirms the local listener, not that an interactive desktop login has succeeded.'
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+
+      - name: Install MetaTrader 5 (Deriv) and Visual Studio Code
+        shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
 
-          $repoUrl = "https://github.com/Techtoxic/Oopus4.8-advanced-deriv-trading-algos-2026.git"
+          # MetaTrader 5 - Deriv installer
+          $mt5Url = 'https://download.mql5.com/cdn/web/deriv.com.limited/mt5/deriv5setup.exe'
+          $mt5Path = Join-Path $env:TEMP 'deriv5setup.exe'
+          Invoke-WebRequest -Uri $mt5Url -OutFile $mt5Path -UseBasicParsing
+          $mt5 = Start-Process -FilePath $mt5Path -ArgumentList '/auto' -Wait -PassThru
+          Remove-Item $mt5Path -Force -ErrorAction SilentlyContinue
+          if ($mt5.ExitCode -ne 0) {
+            throw "Deriv MT5 installer exited with code $($mt5.ExitCode)."
+          }
+          Write-Host 'Deriv MT5 installer finished.'
 
-          $downloadsDir = "C:\Users\maxxciey\Downloads"
+          # Download the current stable VS Code user-independent installer.
+          $vscodeUrl = 'https://update.code.visualstudio.com/latest/win32-x64/stable'
+          $vscodePath = Join-Path $env:TEMP 'vscode-setup.exe'
+          Invoke-WebRequest -Uri $vscodeUrl -OutFile $vscodePath -UseBasicParsing
+          $vscode = Start-Process -FilePath $vscodePath `
+            -ArgumentList @('/VERYSILENT', '/NORESTART', '/ALLUSERS', '/MERGETASKS=!runcode,addcontextmenufiles,addcontextmenufolders,addtopath') `
+            -Wait -PassThru
+          Remove-Item $vscodePath -Force -ErrorAction SilentlyContinue
+          if ($vscode.ExitCode -ne 0) {
+            throw "VS Code installer exited with code $($vscode.ExitCode)."
+          }
 
-          New-Item `
-            -ItemType Directory `
-            -Force `
-            -Path $downloadsDir | Out-Null
+          if (-not (Test-Path 'C:\Program Files\Microsoft VS Code\Code.exe')) {
+            throw 'VS Code installation could not be verified at C:\Program Files\Microsoft VS Code\Code.exe.'
+          }
+          Write-Host 'VS Code installation confirmed.'
 
-          $cloneDir = "$downloadsDir\Oopus4.8-advanced-deriv-trading-algos-2026"
+      - name: Clone repository into maxxciey's Downloads folder
+        shell: powershell
+        env:
+          GTOKEN: ${{ secrets.GTOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:GTOKEN)) {
+            throw 'Missing repository secret GTOKEN. It must have read access to the target repository.'
+          }
 
-          # Remove existing directory if present
+          $repoUrl = 'https://github.com/Techtoxic/Oopus4.8-advanced-deriv-trading-algos-2026.git'
+          $downloadsDir = 'C:\Users\maxxciey\Downloads'
+          New-Item -ItemType Directory -Path $downloadsDir -Force | Out-Null
+          $cloneDir = Join-Path $downloadsDir 'Oopus4.8-advanced-deriv-trading-algos-2026'
+
           if (Test-Path $cloneDir) {
-              Remove-Item $cloneDir -Recurse -Force
+            Remove-Item $cloneDir -Recurse -Force
           }
 
-          # Remove accidental whitespace/newlines from the token
-          $token = "${{ secrets.GTOKEN }}".Trim()
-
-          # Build GitHub Basic authentication header
-          $authBytes = [Text.Encoding]::ASCII.GetBytes(
-              "x-access-token:$token"
-          )
-
+          $token = $env:GTOKEN.Trim()
+          $authBytes = [System.Text.Encoding]::ASCII.GetBytes("x-access-token:$token")
           $auth = [Convert]::ToBase64String($authBytes)
+          $token = $null
+          $authBytes = $null
 
-          # Clone ONLY the fable-thoughts branch
-          git `
-            -c "http.extraheader=AUTHORIZATION: basic $auth" `
-            clone `
+          & git -c "http.extraheader=AUTHORIZATION: basic $auth" clone `
             --branch fable-thoughts `
             --single-branch `
             $repoUrl `
             $cloneDir
+          $gitExitCode = $LASTEXITCODE
+          $auth = $null
 
-          if (-not (Test-Path "$cloneDir\.git")) {
-              Write-Error "Clone failed — check GTOKEN permissions and that fable-thoughts exists."
-              exit 1
+          if ($gitExitCode -ne 0 -or -not (Test-Path (Join-Path $cloneDir '.git'))) {
+            throw 'Repository clone failed. Check GTOKEN permissions and that the fable-thoughts branch exists.'
           }
 
-          Write-Host "Repo cloned successfully."
-          Write-Host "Repository: Oopus4.8-advanced-deriv-trading-algos-2026"
-          Write-Host "Branch: fable-thoughts"
+          Write-Host 'Repository cloned successfully.'
+          Write-Host 'Repository: Oopus4.8-advanced-deriv-trading-algos-2026'
+          Write-Host 'Branch: fable-thoughts'
           Write-Host "Location: $cloneDir"
 
-      - name: Maintain Connection
+      - name: Print RDP connection details
+        shell: powershell
         run: |
-          Write-Host ""
-          Write-Host "======================================"
-          Write-Host "          RDP ACCESS"
-          Write-Host "======================================"
+          Write-Host ''
+          Write-Host '============== RDP ACCESS =============='
           Write-Host "Address:  $env:TAILSCALE_IP"
-          Write-Host "Username: maxxciey"
+          Write-Host 'Username: .\maxxciey'
           Write-Host "Password: $env:RDP_PASSWORD"
-          Write-Host "======================================"
-          Write-Host ""
+          Write-Host 'Port:     3389'
+          Write-Host '========================================'
+          Write-Host 'Anyone with access to this Actions log may be able to view this generated password.'
 
-          Write-Host "Starting RDP health monitor..."
-          Write-Host "TermService will be checked every 60 seconds."
-          Write-Host ""
+      - name: Monitor RDP without disrupting active sessions
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $tailscaleExe = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
+          $iteration = 0
 
+          Write-Host 'Starting RDP health monitor. It will NOT restart TermService just because a listener check fails.'
           while ($true) {
+            $iteration++
+            $now = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            $service = Get-Service -Name TermService -ErrorAction SilentlyContinue
+            $listener = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+            $tailscaleStatus = 'unavailable'
+            if (Test-Path $tailscaleExe) {
+              $tailscaleStatus = (& $tailscaleExe status 2>&1 | Out-String).Trim()
+            }
 
+            Write-Host "[$now] TermService=$($service.Status); TCP3389Listening=$([bool]$listener); TailscaleIP=$env:TAILSCALE_IP"
+            if ($service -and $service.Status -ne 'Running') {
+              Write-Warning "TermService status is $($service.Status); attempting Start-Service (not a forced restart)."
               try {
-
-                  # ==========================================
-                  # CHECK TERMINAL SERVICES
-                  # ==========================================
-
-                  $service = Get-Service `
-                    -Name TermService `
-                    -ErrorAction Stop
-
-                  if ($service.Status -ne "Running") {
-
-                      Write-Host ""
-                      Write-Host "[$(Get-Date)] WARNING: TermService status = $($service.Status)"
-                      Write-Host "Attempting to start TermService..."
-
-                      Start-Service `
-                        -Name TermService `
-                        -ErrorAction Stop
-
-                      Start-Sleep -Seconds 10
-
-                      $service = Get-Service -Name TermService
-
-                      Write-Host "[$(Get-Date)] TermService status: $($service.Status)"
-                  }
-
-                  # ==========================================
-                  # CHECK RDP PORT
-                  # ==========================================
-
-                  $listener = Get-NetTCPConnection `
-                    -LocalPort 3389 `
-                    -State Listen `
-                    -ErrorAction SilentlyContinue
-
-                  if (-not $listener) {
-
-                      Write-Host ""
-                      Write-Host "[$(Get-Date)] WARNING: RDP port 3389 is NOT listening."
-                      Write-Host "Restarting TermService..."
-
-                      Restart-Service `
-                        -Name TermService `
-                        -Force `
-                        -ErrorAction Stop
-
-                      Start-Sleep -Seconds 15
-
-                      $listener = Get-NetTCPConnection `
-                        -LocalPort 3389 `
-                        -State Listen `
-                        -ErrorAction SilentlyContinue
-
-                      if ($listener) {
-                          Write-Host "[$(Get-Date)] RDP listener restored successfully."
-                      }
-                      else {
-                          Write-Host "[$(Get-Date)] WARNING: RDP listener still unavailable."
-                      }
-                  }
-
-                  # ==========================================
-                  # CHECK TAILSCALE
-                  # ==========================================
-
-                  $tailscaleStatus = & `
-                    "$env:ProgramFiles\Tailscale\tailscale.exe" `
-                    status 2>&1
-
-                  if ($LASTEXITCODE -ne 0) {
-
-                      Write-Host ""
-                      Write-Host "[$(Get-Date)] WARNING: Tailscale status check failed."
-                      Write-Host "Attempting to restart Tailscale..."
-
-                      Restart-Service `
-                        -Name Tailscale `
-                        -Force `
-                        -ErrorAction SilentlyContinue
-
-                      Start-Sleep -Seconds 15
-                  }
-
-                  # ==========================================
-                  # NORMAL STATUS
-                  # ==========================================
-
-                  Write-Host ""
-                  Write-Host "[$(Get-Date)] RDP Active"
-                  Write-Host "    TermService: $((Get-Service TermService).Status)"
-                  Write-Host "    RDP Port:    3389"
-                  Write-Host "    Tailscale:   OK"
-
+                Start-Service -Name TermService -ErrorAction Stop
+                Start-Sleep -Seconds 5
+              } catch {
+                Write-Warning "Could not start TermService: $($_.Exception.Message)"
               }
+            }
+            if (-not $listener) {
+              Write-Warning 'TCP 3389 listener is missing. No forced service restart was issued to avoid breaking a live session.'
+            }
 
-              catch {
+            # Every five minutes, record whether a desktop shell is present and review recent logon errors.
+            if (($iteration % 5) -eq 0) {
+              Write-Host '--- Session list (quser) ---'
+              & "$env:SystemRoot\System32\quser.exe" 2>&1 | ForEach-Object { Write-Host $_ }
 
-                  Write-Host ""
-                  Write-Host "[$(Get-Date)] RDP health check failed:"
-                  Write-Host $_.Exception.Message
+              Write-Host '--- Explorer processes by session ---'
+              Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue |
+                Select-Object ProcessId, ParentProcessId, SessionId, CommandLine |
+                Format-Table -AutoSize | Out-String | ForEach-Object { Write-Host $_ }
 
-                  # ==========================================
-                  # RECOVERY
-                  # ==========================================
-
-                  try {
-
-                      Write-Host "[$(Get-Date)] Attempting TermService recovery..."
-
-                      Restart-Service `
-                        -Name TermService `
-                        -Force `
-                        -ErrorAction Stop
-
-                      Start-Sleep -Seconds 15
-
-                      Write-Host "[$(Get-Date)] TermService recovery completed."
-
-                  }
-                  catch {
-
-                      Write-Host ""
-                      Write-Host "[$(Get-Date)] ERROR: Could not restart TermService."
-                      Write-Host $_.Exception.Message
-                  }
+              Write-Host '--- Recent RDP/profile/shell errors ---'
+              $recent = Get-WinEvent -FilterHashtable @{
+                LogName = 'Application'
+                StartTime = (Get-Date).AddMinutes(-10)
+              } -ErrorAction SilentlyContinue |
+                Where-Object {
+                  $_.ProviderName -match 'Winlogon|User Profile Service|Application Error|Windows Error Reporting' -and
+                  $_.Message -match 'explorer|userinit|profile|logon|remote desktop'
+                } |
+                Select-Object -First 5 TimeCreated, Id, ProviderName, Message
+              if ($recent) {
+                $recent | Format-List | Out-String | ForEach-Object { Write-Host $_ }
+              } else {
+                Write-Host 'No matching recent Application log errors found.'
               }
+            }
 
-              # ==========================================
-              # WAIT BEFORE NEXT HEALTH CHECK
-              # ==========================================
-
-              Start-Sleep -Seconds 60
+            Start-Sleep -Seconds 60
           }
